@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 import glob
 import argparse
 import subprocess
@@ -122,6 +123,10 @@ class SlurmJobCollector(object):
         self.MONITOR_DCGM = False
         self.MONITOR_PYNVML = False
         self.UNSUPPORTED_FEATURES = []
+        # CHECK-UNUSED-GPUS PATCH: optional NVML handle used as a utilization
+        # fallback for GPUs without DCGM profiling (set up below in dcgm mode).
+        self.nvml = None
+        self.nvml_handles = {}  # GPU UUID -> NVML handle
         if monitor == 'dcgm':
             self.handle = pydcgm.DcgmHandle(None, 'localhost')
 
@@ -170,10 +175,16 @@ class SlurmJobCollector(object):
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL,
                 dcgm_fields.DCGM_FI_DEV_FB_USED,
             }
-            metric_groups = pydcgm.dcgm_agent.dcgmProfGetSupportedMetricGroups(self.handle.handle, saved_gpu_id)
-            for mg in metric_groups.metricGroups[:metric_groups.numMetricGroups]:
-                for field in mg.fieldIds[:mg.numFieldIds]:
-                    avail_metrics.add(field)
+            # CHECK-UNUSED-GPUS PATCH: profiling-tolerant
+            # Older GPUs (Maxwell/Pascal/early Volta) lack DCGM profiling.
+            # Treat that as 'no profiling metrics' rather than crash.
+            try:
+                metric_groups = pydcgm.dcgm_agent.dcgmProfGetSupportedMetricGroups(self.handle.handle, saved_gpu_id)
+                for mg in metric_groups.metricGroups[:metric_groups.numMetricGroups]:
+                    for field in mg.fieldIds[:mg.numFieldIds]:
+                        avail_metrics.add(field)
+            except Exception as e:
+                print('Profiling not available on this GPU (%s); skipping profiling metrics' % e)
             # This is to only keep the available metrics from the set
             # of those we want
             self.used_metrics = set(self.fieldIds_dict.keys()) & avail_metrics
@@ -201,6 +212,38 @@ class SlurmJobCollector(object):
             print('Monitoring GPUs with DCGM with an update interval of {} seconds'.format(dcgm_update_interval))
             self.MONITOR_DCGM = True
 
+            # CHECK-UNUSED-GPUS PATCH: NVML utilization fallback.
+            # GPUs without DCGM profiling (Turing/Pascal/Volta, or profiling-less
+            # cards in a heterogeneous node) never report sm_active/dram_active, so
+            # slurm_job_utilization_gpu would be missing for those jobs. Bring up
+            # NVML alongside DCGM so collect() can fall back to device-level
+            # utilization for those cards. Optional: if NVML can't be imported or
+            # initialised, those GPUs simply won't report utilization (no crash).
+            try:
+                import pynvml as _nvml
+            except ImportError:
+                try:
+                    import py3nvml.py3nvml as _nvml
+                except ImportError:
+                    _nvml = None
+            if _nvml is not None:
+                try:
+                    _nvml.nvmlInit()
+                    self.nvml = _nvml
+                    # Map GPU UUID -> NVML handle once. slurm-job-exporter labels
+                    # GPUs by job-local cgroup index, not physical index, so the
+                    # fallback must resolve handles by UUID rather than by index.
+                    for i in range(_nvml.nvmlDeviceGetCount()):
+                        handle = _nvml.nvmlDeviceGetHandleByIndex(i)
+                        uuid = _nvml.nvmlDeviceGetUUID(handle)
+                        if isinstance(uuid, bytes):
+                            uuid = uuid.decode()
+                        self.nvml_handles[uuid] = handle
+                    print('NVML initialised for utilization fallback on non-profiling GPUs '
+                          '({} devices mapped)'.format(len(self.nvml_handles)))
+                except _nvml.NVMLError as e:
+                    print('NVML init failed (%s); non-profiling GPUs will lack utilization' % e)
+
         elif monitor == 'nvml':
             try:
                 pynvml.nvmlInit()
@@ -220,7 +263,15 @@ class SlurmJobCollector(object):
                 for v in data[k].keys():
                     data_dict = {}
                     for metric_id in data[k][v].keys():
-                        data_dict[self.fieldIds_dict[metric_id]] = data[k][v][metric_id].values[0].value
+                        value = data[k][v][metric_id].values[0].value
+                        # CHECK-UNUSED-GPUS PATCH: drop blank/None profiling fields.
+                        # On GPUs without profiling (or in a heterogeneous node where
+                        # profiling is enabled for the group but unsupported on some
+                        # cards) DCGM returns None for those fields. Keeping them would
+                        # let the downstream "if 'x' in dict" checks pass and then do
+                        # None * 100 -> TypeError, aborting the whole scrape (HTTP 500).
+                        if value is not None:
+                            data_dict[self.fieldIds_dict[metric_id]] = value
                     gpus[data_dict['uuid']] = data_dict
 
         return gpus
@@ -567,12 +618,32 @@ per elapsed cycle)',
                     metrics["gauge_power_gpu"].add_metric(
                         [user, account, job, str(gpu), gpu_type],
                         dcgm_data[gpu_uuid]['power_usage'] * 1000)  # convert to mW
-                    metrics["gauge_utilization_gpu"].add_metric(
-                        [user, account, job, str(gpu), gpu_type],
-                        dcgm_data[gpu_uuid]['sm_active'] * 100)  # convert to %
-                    metrics["gauge_memory_utilization_gpu"].add_metric(
-                        [user, account, job, str(gpu), gpu_type],
-                        dcgm_data[gpu_uuid]['dram_active'] * 100)  # convert to %
+                    sm_active = dcgm_data[gpu_uuid].get('sm_active')
+                    dram_active = dcgm_data[gpu_uuid].get('dram_active')
+                    if sm_active is not None:
+                        metrics["gauge_utilization_gpu"].add_metric(
+                            [user, account, job, str(gpu), gpu_type],
+                            sm_active * 100)  # convert to %
+                    if dram_active is not None:
+                        metrics["gauge_memory_utilization_gpu"].add_metric(
+                            [user, account, job, str(gpu), gpu_type],
+                            dram_active * 100)  # convert to %
+                    # CHECK-UNUSED-GPUS PATCH: NVML utilization fallback.
+                    # When DCGM has no profiling data for this GPU (sm_active absent),
+                    # fall back to NVML's device-level utilization so non-profiling
+                    # cards still report slurm_job_utilization_gpu/_gpu_memory. Skip
+                    # MIG instances (gpu_tuple[0] is None) — NVML here indexes full GPUs.
+                    if sm_active is None and self.nvml is not None and gpu_tuple[0] is not None:
+                        nvml_handle = self.nvml_handles.get(gpu_uuid)
+                        if nvml_handle is not None:
+                            try:
+                                rates = self.nvml.nvmlDeviceGetUtilizationRates(nvml_handle)
+                                metrics["gauge_utilization_gpu"].add_metric(
+                                    [user, account, job, str(gpu), gpu_type], rates.gpu)
+                                metrics["gauge_memory_utilization_gpu"].add_metric(
+                                    [user, account, job, str(gpu), gpu_type], rates.memory)
+                            except self.nvml.NVMLError:
+                                pass
 
                     # Convert to % to keep the same format as NVML
                     if 'sm_occupancy' in dcgm_data[gpu_uuid]:
