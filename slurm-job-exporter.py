@@ -72,6 +72,32 @@ def get_env(pid):
         raise ValueError("Could not get environment for {}".format(pid))
 
 
+def scontrol_job_owner(job):
+    """
+    Resolve (uid, user, account) for a job from scontrol.
+
+    Used when a job's cgroup has no running process to read these from (the step
+    exited or never launched while Slurm still holds the allocation). On cgroup
+    v2 the cgroup is root-owned and the uid is otherwise only available from a
+    process, so without this a held-but-idle allocation could not be attributed.
+    Returns (None, None, None) if the job can't be resolved.
+    """
+    try:
+        out = subprocess.check_output(
+            ['scontrol', 'show', 'job', str(job)],
+            stderr=subprocess.DEVNULL).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None, None, None
+    m = re.search(r'UserId=(\S+?)\((\d+)\)', out)
+    if not m:
+        return None, None, None
+    user = m.group(1)
+    uid = int(m.group(2))
+    account_m = re.search(r'Account=(\S+)', out)
+    account = account_m.group(1) if account_m else "error"
+    return uid, user, account
+
+
 def cgroup_gpus(job_dir, cgroups):
     if cgroups == 1:
         task_file = os.path.join(job_dir, "tasks")
@@ -408,11 +434,23 @@ per elapsed cycle)',
         for job_dir in glob.glob(jobs_glob):
             job = job_dir.split('/')[-1].split('_')[1]
             uid, procs = cgroup_processes(job_dir)
-            if len(procs) == 0:
-                continue
 
-            # Job is alive, we can get the stats
-            user = get_username(uid)
+            if len(procs) == 0:
+                # The job holds its allocation (GPUs, memory) but has no running
+                # process — the step exited or never launched while Slurm still
+                # reserves the resources. Report it so a held-but-idle allocation
+                # stays visible instead of silently disappearing. The uid is
+                # normally read off a process (and on cgroup v2 the cgroup is
+                # root-owned), so resolve the owner and account from scontrol.
+                uid, user, account = scontrol_job_owner(job)
+                if uid is None:
+                    # Job vanished between the glob and the lookup — skip it.
+                    continue
+            else:
+                # Job is alive; owner comes from its processes, account below.
+                user = get_username(uid)
+                account = None
+
             gpu_set = set()
             if self.MONITOR_PYNVML or self.MONITOR_DCGM:
                 if cgroups == 1:
@@ -421,19 +459,20 @@ per elapsed cycle)',
                     gpu_dir = job_dir
                 gpu_set.update(cgroup_gpus(gpu_dir, cgroups))
 
-            for proc in procs:
-                # get the SLURM_JOB_ACCOUNT
-                try:
-                    envs = get_env(proc)
-                except ValueError:
-                    # Process does not have an environment, its probably gone
-                    continue
-                if 'SLURM_JOB_ACCOUNT' in envs:
-                    account = envs['SLURM_JOB_ACCOUNT']
-                    break
-            else:
-                # Could not find the env variables, slurm_adopt only fill the jobid
-                account = "error"
+            if account is None:
+                for proc in procs:
+                    # get the SLURM_JOB_ACCOUNT
+                    try:
+                        envs = get_env(proc)
+                    except ValueError:
+                        # Process does not have an environment, its probably gone
+                        continue
+                    if 'SLURM_JOB_ACCOUNT' in envs:
+                        account = envs['SLURM_JOB_ACCOUNT']
+                        break
+                else:
+                    # Could not find the env variables, slurm_adopt only fill the jobid
+                    account = "error"
 
             with open(os.path.join(job_dir, ('memory.usage_in_bytes' if cgroups == 1 else 'memory.current')), 'r') as f_usage:
                 metrics["gauge_memory_usage"].add_metric([user, account, job], int(f_usage.read()))
