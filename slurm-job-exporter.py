@@ -230,7 +230,7 @@ class SlurmJobCollector(object):
             self.groups["gpu"].samples.WatchFields(self.field_groups["gpu"], dcgm_update_interval * 1000 * 1000, dcgm_update_interval * 2.0, 5)
 
             if "mig" in self.groups:
-                self.field_groups["mig"] = pydcgm.DcgmFieldGroup(self.handle, name="slurm-job-exporter-mig-fg", fieldIds=list(set(self.used_metrics) ^ missing_mig_metrics))
+                self.field_groups["mig"] = pydcgm.DcgmFieldGroup(self.handle, name="slurm-job-exporter-mig-fg", fieldIds=list(set(self.used_metrics) - missing_mig_metrics))
                 self.groups["mig"].samples.WatchFields(self.field_groups["mig"], dcgm_update_interval * 1000 * 1000, dcgm_update_interval * 2.0, 5)
 
             self.handle.GetSystem().UpdateAllFields(True)
@@ -431,7 +431,17 @@ per elapsed cycle)',
             jobs_glob = "/sys/fs/cgroup/memory/slurm/uid_*/job_*"
         else:
             jobs_glob = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_*"
-        for job_dir in glob.glob(jobs_glob):
+
+        # DCGM values are node-global and identical for every job, so fetch them
+        # once per scrape rather than re-fetching inside the per-job loop.
+        dcgm_data = self.GetLatestGpuValuesAsDict() if self.MONITOR_DCGM else {}
+
+        # Each job is handled by this closure, called under try/except below.
+        # Slurm tears cgroups down asynchronously, so any cgroup file can vanish
+        # mid-scrape; isolating each job keeps one teardown from aborting the
+        # whole /metrics response (which would blank every job on the node). It
+        # is a closure so the body below keeps its original indentation.
+        def _process_job(job_dir):
             job = job_dir.split('/')[-1].split('_')[1]
             uid, procs = cgroup_processes(job_dir)
 
@@ -445,7 +455,7 @@ per elapsed cycle)',
                 uid, user, account = scontrol_job_owner(job)
                 if uid is None:
                     # Job vanished between the glob and the lookup — skip it.
-                    continue
+                    return
             else:
                 # Job is alive; owner comes from its processes, account below.
                 user = get_username(uid)
@@ -484,7 +494,11 @@ per elapsed cycle)',
                 pass
 
             with open(os.path.join(job_dir, ('memory.limit_in_bytes' if cgroups == 1 else 'memory.max')), 'r') as f_limit:
-                metrics["gauge_memory_limit"].add_metric([user, account, job], int(f_limit.read()))
+                limit = f_limit.read().strip()
+                # cgroup v2 reports the literal "max" for an unconstrained job;
+                # int("max") would raise and 500 the scrape, so only emit a number.
+                if limit != "max":
+                    metrics["gauge_memory_limit"].add_metric([user, account, job], int(limit))
 
             with open(os.path.join(job_dir, 'memory.stat'), 'r') as f_stats:
                 stats = dict(line.split() for line in f_stats.readlines())
@@ -643,7 +657,6 @@ per elapsed cycle)',
                         [user, account, job, str(gpu), gpu_type], utils.memory)
 
             if self.MONITOR_DCGM:
-                dcgm_data = self.GetLatestGpuValuesAsDict()
                 for gpu_tuple in gpu_set:
                     if gpu_tuple[0] is None:
                         # MIG, use the UUID of the GPU
@@ -652,17 +665,29 @@ per elapsed cycle)',
                         # Full GPU, can be with dcgm or pynvml, use the gpu number
                         gpu = gpu_tuple[0]
                     gpu_uuid = gpu_tuple[1]
+                    # The probe can surface a GPU UUID that DCGM doesn't know
+                    # (e.g. a MIG UUID-format mismatch across driver versions);
+                    # skip it rather than KeyError-ing the whole scrape.
+                    if gpu_uuid not in dcgm_data:
+                        continue
                     gpu_type = dcgm_data[gpu_uuid]['name']
-                    # Converting DCGM data to the same format as NVML and reusing the same metrics
-                    metrics["gauge_memory_total_gpu"].add_metric(
-                        [user, account, job, str(gpu), gpu_type],
-                        int(dcgm_data[gpu_uuid]['fb_total']) * 1024 * 1024)  # convert to bytes
-                    metrics["gauge_memory_usage_gpu"].add_metric(
-                        [user, account, job, str(gpu), gpu_type],
-                        int(dcgm_data[gpu_uuid]['fb_used']) * 1024 * 1024)  # convert to bytes
-                    metrics["gauge_power_gpu"].add_metric(
-                        [user, account, job, str(gpu), gpu_type],
-                        dcgm_data[gpu_uuid]['power_usage'] * 1000)  # convert to mW
+                    # Converting DCGM data to the same format as NVML and reusing the same metrics.
+                    # fb_total/fb_used/power_usage are normally always present, but
+                    # power reporting is NotSupported on some cards and is then
+                    # dropped as None upstream — read them defensively so a missing
+                    # one can't 500 the scrape.
+                    if 'fb_total' in dcgm_data[gpu_uuid]:
+                        metrics["gauge_memory_total_gpu"].add_metric(
+                            [user, account, job, str(gpu), gpu_type],
+                            int(dcgm_data[gpu_uuid]['fb_total']) * 1024 * 1024)  # convert to bytes
+                    if 'fb_used' in dcgm_data[gpu_uuid]:
+                        metrics["gauge_memory_usage_gpu"].add_metric(
+                            [user, account, job, str(gpu), gpu_type],
+                            int(dcgm_data[gpu_uuid]['fb_used']) * 1024 * 1024)  # convert to bytes
+                    if 'power_usage' in dcgm_data[gpu_uuid]:
+                        metrics["gauge_power_gpu"].add_metric(
+                            [user, account, job, str(gpu), gpu_type],
+                            dcgm_data[gpu_uuid]['power_usage'] * 1000)  # convert to mW
                     sm_active = dcgm_data[gpu_uuid].get('sm_active')
                     dram_active = dcgm_data[gpu_uuid].get('dram_active')
                     if sm_active is not None:
@@ -728,6 +753,14 @@ per elapsed cycle)',
                         metrics["gauge_nvlink_gpu"].add_metric(
                             [user, account, job, str(gpu), gpu_type, 'RX'],
                             dcgm_data[gpu_uuid]['nvlink_rx_bytes'])
+
+        for job_dir in glob.glob(jobs_glob):
+            try:
+                _process_job(job_dir)
+            except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
+                # The job's cgroup was torn down mid-scrape; skip just this job so
+                # the rest of the node's metrics are still reported.
+                continue
 
         yield from metrics.values()
 
