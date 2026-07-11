@@ -98,6 +98,41 @@ def scontrol_job_owner(job):
     return uid, user, account
 
 
+# CHECK-UNUSED-GPUS PATCH: Slurm >= 25.11 (cgroup/v2) SLUID cgroup naming.
+# Slurm 25.11/26.05 renamed the job-level cgroup from job_<jobid> to the job's
+# SLUID (an "s" + Crockford-base32 string, e.g. slurmstepd.scope/s8FXKX84GSBB00/).
+# A SLUID encodes [cluster|unix_ms|sequence] and is NOT the jobid, so the numeric
+# jobid can't be parsed from the directory name any more. Recover it locally from
+# the slurmstepd process title, which Slurm renders as "slurmstepd: [<jobid>.<step>]".
+STEPD_JOBID_RE = re.compile(r'slurmstepd:\s*\[(\d+)')
+
+
+def jobid_from_stepd(job_dir):
+    """
+    Resolve the numeric Slurm jobid for a SLUID-named job cgroup by reading the
+    slurmstepd process title from any pid in the cgroup subtree. Every held
+    allocation keeps an extern-step slurmstepd alive, so this also works for
+    idle / process-less jobs, with no slurmctld round-trip. Returns None when no
+    slurmstepd can be found (a non-job cgroup, or one being torn down).
+    """
+    for (path, _, _) in os.walk(job_dir):
+        try:
+            with open(os.path.join(path, "cgroup.procs"), 'r') as fprocs:
+                pids = fprocs.read().split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        for pid in pids:
+            try:
+                with open("/proc/{}/cmdline".format(pid), 'rb') as fcmd:
+                    cmd = fcmd.read().replace(b'\x00', b' ').decode('utf-8', 'replace')
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            m = STEPD_JOBID_RE.search(cmd)
+            if m:
+                return m.group(1)
+    return None
+
+
 def cgroup_gpus(job_dir, cgroups):
     if cgroups == 1:
         task_file = os.path.join(job_dir, "tasks")
@@ -430,7 +465,10 @@ per elapsed cycle)',
         if cgroups == 1:
             jobs_glob = "/sys/fs/cgroup/memory/slurm/uid_*/job_*"
         else:
-            jobs_glob = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_*"
+            # Slurm >= 25.11 names job cgroups by SLUID, not job_<jobid>, so we
+            # can no longer glob "job_*". Glob every entry under slurmstepd.scope
+            # and classify each in the loop below (job_<id>, SLUID, or non-job).
+            jobs_glob = "/sys/fs/cgroup/system.slice/slurmstepd.scope/*"
 
         # DCGM values are node-global and identical for every job, so fetch them
         # once per scrape rather than re-fetching inside the per-job loop.
@@ -441,8 +479,7 @@ per elapsed cycle)',
         # mid-scrape; isolating each job keeps one teardown from aborting the
         # whole /metrics response (which would blank every job on the node). It
         # is a closure so the body below keeps its original indentation.
-        def _process_job(job_dir):
-            job = job_dir.split('/')[-1].split('_')[1]
+        def _process_job(job_dir, job):
             uid, procs = cgroup_processes(job_dir)
 
             if len(procs) == 0:
@@ -755,8 +792,27 @@ per elapsed cycle)',
                             dcgm_data[gpu_uuid]['nvlink_rx_bytes'])
 
         for job_dir in glob.glob(jobs_glob):
+            # slurmstepd.scope/* also globs cgroup control files (cgroup.procs,
+            # memory.stat, ...) — only directories are job/step cgroups.
+            if not os.path.isdir(job_dir):
+                continue
+            base = os.path.basename(job_dir)
+            if cgroups == 1:
+                # v1 glob only matches job_<id>; the jobid is in the dir name.
+                job = base.split('_', 1)[1]
+            else:
+                # v2: the 'system' entry is slurmstepd's own housekeeping cgroup.
+                if base == 'system':
+                    continue
+                # Resolve the jobid from the live slurmstepd title. This handles
+                # both SLUID dirs (Slurm >= 25.11) and legacy job_<id> dirs, and
+                # skips stale pre-upgrade job_<id> leftovers for free (no stepd ->
+                # None), avoiding a scontrol call per stale directory.
+                job = jobid_from_stepd(job_dir)
+                if job is None:
+                    continue
             try:
-                _process_job(job_dir)
+                _process_job(job_dir, job)
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
                 # The job's cgroup was torn down mid-scrape; skip just this job so
                 # the rest of the node's metrics are still reported.
