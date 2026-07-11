@@ -12,6 +12,13 @@ from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily
 from prometheus_client import make_wsgi_app
 
 
+# Fork version. Bump on every deployed change and keep it in sync with the git
+# tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
+# so Prometheus can see, and alert on, version drift across the fleet (the exact
+# blind spot that let a hand-hotfixed build diverge from git unnoticed).
+__version__ = "0.4.12+cus.1"
+
+
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
 
 
@@ -183,7 +190,6 @@ class SlurmJobCollector(object):
         # Will be auto detected by the exporter
         self.MONITOR_DCGM = False
         self.MONITOR_PYNVML = False
-        self.UNSUPPORTED_FEATURES = []
         # CHECK-UNUSED-GPUS PATCH: optional NVML handle used as a utilization
         # fallback for GPUs without DCGM profiling (set up below in dcgm mode).
         self.nvml = None
@@ -340,8 +346,39 @@ class SlurmJobCollector(object):
     def collect(self):
         """
         Run a collection cycle and update exported stats
+
+        Job discovery contract (see also the job loop below): on cgroup v2 we do
+        NOT parse the jobid from the cgroup directory name — Slurm >= 25.11 names
+        it by SLUID, which is not the jobid — and we do NOT branch on the Slurm
+        version. We resolve the jobid from the live slurmstepd process title
+        ("slurmstepd: [<jobid>.<step>]"), which is stable across Slurm releases.
+        The one upgrade to watch is a change to that title format.
         """
         metrics = {}
+
+        # Exporter self-info, always emitted (even on an idle node) so Prometheus
+        # can track build/version and the active GPU monitoring mode fleet-wide.
+        build_info = GaugeMetricFamily(
+            'slurm_job_exporter_build_info',
+            'Exporter version and active GPU monitoring mode (value always 1).',
+            labels=['version', 'mode'])
+        if self.MONITOR_DCGM:
+            mode = 'dcgm+nvml' if self.nvml is not None else 'dcgm'
+        elif self.MONITOR_PYNVML:
+            mode = 'nvml'
+        else:
+            mode = 'none'
+        build_info.add_metric([__version__, mode], 1)
+        metrics['build_info'] = build_info
+
+        # Count of job cgroups that raised an unexpected error this scrape (see
+        # the job loop). Emitted so silent per-job failures are visible instead
+        # of just vanishing from the output.
+        metrics['scrape_errors'] = GaugeMetricFamily(
+            'slurm_job_exporter_scrape_job_errors',
+            'Job cgroups that raised an unexpected error during this scrape.',
+            labels=[])
+
         metrics['gauge_memory_usage'] = GaugeMetricFamily(
             'slurm_job_memory_usage', 'Memory used by a job',
             labels=['user', 'account', 'slurmjobid'])
@@ -791,6 +828,7 @@ per elapsed cycle)',
                             [user, account, job, str(gpu), gpu_type, 'RX'],
                             dcgm_data[gpu_uuid]['nvlink_rx_bytes'])
 
+        scrape_job_errors = 0
         for job_dir in glob.glob(jobs_glob):
             # slurmstepd.scope/* also globs cgroup control files (cgroup.procs,
             # memory.stat, ...) — only directories are job/step cgroups.
@@ -814,10 +852,20 @@ per elapsed cycle)',
             try:
                 _process_job(job_dir, job)
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
-                # The job's cgroup was torn down mid-scrape; skip just this job so
-                # the rest of the node's metrics are still reported.
+                # Expected: the job's cgroup was torn down mid-scrape. Skip just
+                # this job so the rest of the node's metrics are still reported.
+                continue
+            except Exception as e:
+                # Unexpected (e.g. a cgroup field that changed on a kernel/Slurm
+                # bump): isolate it to this job rather than 500-ing the whole
+                # scrape, which would blank every job on the node. Surface it to
+                # the journal and count it so the failure is visible, not silent.
+                scrape_job_errors += 1
+                print('scrape error on {}: {}: {}'.format(
+                    job_dir, type(e).__name__, e), file=sys.stderr)
                 continue
 
+        metrics['scrape_errors'].add_metric([], scrape_job_errors)
         yield from metrics.values()
 
 
