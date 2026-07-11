@@ -3,6 +3,15 @@ Description=Slurm-job-exporter
 After=network.target
 After=nvidia-dcgm.service
 Wants=nvidia-dcgm.service
+# Cycle the exporter whenever the DCGM host engine is cycled (package update,
+# driver reload, Salt highstate). Without this a bare nvidia-dcgm restart leaves
+# the exporter holding a stale, invalidated DCGM handle, and every scrape then
+# 500s silently until someone restarts it by hand.
+PartOf=nvidia-dcgm.service
+# Never give up restarting. The default (5 starts / 10s -> permanent "failed")
+# is exactly what left 36 nodes dead after one transient hiccup. The exporter
+# must always come back.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -10,6 +19,12 @@ EnvironmentFile=-/etc/sysconfig/slurm-job-exporter.conf
 ExecStart=/usr/bin/slurm-job-exporter
 PIDFile=/run/slurm-job-exporter.pid
 KillMode=process
+# Self-heal the DCGM startup race: if slurmstepd connects to nv-hostengine while
+# it is still (re)initialising, DcgmGroup() raises ConnectionNotValid and the
+# process exits 1. Restart after a short delay so the retry lands once the engine
+# is ready (it needs only a second or two to come up).
+Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
