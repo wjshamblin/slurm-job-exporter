@@ -16,10 +16,16 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.1"
+__version__ = "0.4.12+cus.2"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+
+# DCGM's "no value" sentinels for FP64 fields are all >= 2^47 (DCGM_FP64_BLANK,
+# and NOT_FOUND / NOT_SUPPORTED / NOT_PERMISSIONED just above it). A real
+# profiling ratio, memory size, or power reading is never anywhere near this, so
+# any numeric field at or above it is a blank, not data. See GetLatestGpuValuesAsDict.
+DCGM_FP64_BLANK = 140737488355328.0  # == 2^47
 
 
 @lru_cache(maxsize=100)
@@ -331,14 +337,24 @@ class SlurmJobCollector(object):
                     data_dict = {}
                     for metric_id in data[k][v].keys():
                         value = data[k][v][metric_id].values[0].value
-                        # CHECK-UNUSED-GPUS PATCH: drop blank/None profiling fields.
-                        # On GPUs without profiling (or in a heterogeneous node where
-                        # profiling is enabled for the group but unsupported on some
-                        # cards) DCGM returns None for those fields. Keeping them would
-                        # let the downstream "if 'x' in dict" checks pass and then do
-                        # None * 100 -> TypeError, aborting the whole scrape (HTTP 500).
-                        if value is not None:
-                            data_dict[self.fieldIds_dict[metric_id]] = value
+                        # CHECK-UNUSED-GPUS PATCH: drop blank / None / not-supported
+                        # fields. On GPUs without profiling (or a heterogeneous node
+                        # where profiling is enabled for the group but unsupported on
+                        # some cards) DCGM reports "no value" as either None or one of
+                        # its FP64 blank sentinels (>= DCGM_FP64_BLANK). Keeping None
+                        # let the downstream "if x is not None" check pass and do
+                        # None * 100 -> TypeError (HTTP 500); keeping a blank emitted
+                        # blank * 100 (~1.4e16) as utilization, poisoning
+                        # slurm_job_utilization_gpu and the by-type dashboards (seen on
+                        # RTX PRO 6000 Blackwell, which DCGM 4.5.x can't profile). Drop
+                        # both so the field is absent and the NVML fallback in collect()
+                        # supplies the real utilization. String fields (name/uuid) pass
+                        # through untouched.
+                        if value is None:
+                            continue
+                        if isinstance(value, (int, float)) and value >= DCGM_FP64_BLANK:
+                            continue
+                        data_dict[self.fieldIds_dict[metric_id]] = value
                     gpus[data_dict['uuid']] = data_dict
 
         return gpus
