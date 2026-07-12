@@ -6,6 +6,7 @@ import re
 import sys
 import psutil
 import os
+import time
 from functools import lru_cache
 from wsgiref.simple_server import make_server, WSGIRequestHandler
 from prometheus_client.core import GaugeMetricFamily, CounterMetricFamily
@@ -16,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.2"
+__version__ = "0.4.12+cus.3"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -187,11 +188,14 @@ class SlurmJobCollector(object):
     running slurm jobs on a node. This is using the stats from the cgroups
     created by Slurm.
     """
-    def __init__(self, dcgm_update_interval=10, monitor='dcgm'):
+    def __init__(self, dcgm_update_interval=10, monitor='dcgm', dcgm_requested=False):
         """
         Args:
             dcgm_update_interval (int, optional): Pooling interval in seconds used by DCGM. Defaults to 10.
             monitor (str, optional): Choose dcgm or nvml data collection. Defaults to dcgm.
+            dcgm_requested (bool, optional): True when DCGM was asked for, even if we
+                ended up on the nvml fallback. Enables the periodic re-check in
+                collect() that recovers us into DCGM mode. Defaults to False.
         """
         # Will be auto detected by the exporter
         self.MONITOR_DCGM = False
@@ -200,6 +204,10 @@ class SlurmJobCollector(object):
         # fallback for GPUs without DCGM profiling (set up below in dcgm mode).
         self.nvml = None
         self.nvml_handles = {}  # GPU UUID -> NVML handle
+        # CHECK-UNUSED-GPUS PATCH: remember that DCGM was wanted, so a fallback to
+        # nvml can be recovered from rather than being permanent (see collect()).
+        self.dcgm_requested = dcgm_requested
+        self._dcgm_recheck_at = 0.0
         if monitor == 'dcgm':
             self.handle = pydcgm.DcgmHandle(None, 'localhost')
 
@@ -370,6 +378,26 @@ class SlurmJobCollector(object):
         ("slurmstepd: [<jobid>.<step>]"), which is stable across Slurm releases.
         The one upgrade to watch is a change to that title format.
         """
+        # CHECK-UNUSED-GPUS PATCH: recover from a stale nvml fallback.
+        # The dcgm-vs-nvml choice is made at startup. If the host engine was not up
+        # then (e.g. we were restarted alongside nvidia-dcgm), we run degraded --
+        # coarse nvidia-smi utilization instead of DCGM sm_active -- and would never
+        # notice DCGM coming back, because this state never crashes and so
+        # Restart=on-failure cannot catch it. Re-check periodically and, once DCGM is
+        # genuinely usable, exit so systemd restarts us into DCGM mode. We gate on the
+        # exact check the startup path uses, so the restart is guaranteed to land in
+        # DCGM mode -- it cannot become a restart loop.
+        if self.dcgm_requested and not self.MONITOR_DCGM:
+            now = time.monotonic()
+            if now >= self._dcgm_recheck_at:
+                self._dcgm_recheck_at = now + 60
+                if search_dcgm_lib() is not None:
+                    print('nv-hostengine is available again; exiting so systemd '
+                          'restarts the exporter into DCGM mode (it was running on '
+                          'the nvml fallback).', file=sys.stderr)
+                    sys.stderr.flush()
+                    os._exit(1)
+
         metrics = {}
 
         # Exporter self-info, always emitted (even on an idle node) so Prometheus
@@ -893,26 +921,45 @@ class NoLoggingWSGIRequestHandler(WSGIRequestHandler):
         pass
 
 
-def search_dcgm_lib(paths=[]):
-    # Search the list of processes for "nv-hostengine"
-    nvh_found = False
+def nv_hostengine_running():
+    """True if the DCGM host engine (nv-hostengine) process is up."""
     for proc in psutil.process_iter():
         try:
             if proc.name() == 'nv-hostengine':
-                nvh_found = True
-                break
+                return True
         except psutil.NoSuchProcess:
             continue
-    if nvh_found:
-        potential_paths = paths + [
-            "/usr/share/datacenter-gpu-manager-*/bindings/python3/",
-            "/usr/local/dcgm/bindings/python3/"
-        ]
-        for ppath in potential_paths:
-            search_ppath = glob.glob(ppath)
-            if search_ppath:
-                return search_ppath[-1]
-        return None
+    return False
+
+
+def search_dcgm_lib(paths=[], wait_seconds=0):
+    """
+    Locate the DCGM python bindings, optionally waiting for nv-hostengine to appear.
+
+    CHECK-UNUSED-GPUS PATCH: this dcgm-vs-nvml decision used to be made once,
+    instantly, at startup. If nv-hostengine had not finished coming up yet — e.g.
+    the exporter was restarted alongside nvidia-dcgm during a DCGM upgrade — the
+    exporter fell back to nvml for its ENTIRE lifetime, silently reporting the
+    coarse nvidia-smi utilization instead of DCGM sm_active, and never re-checked.
+    It does not crash in that state, so Restart=on-failure cannot catch it either.
+    Poll for a bounded window so a slow or restarting host engine can't permanently
+    downgrade us. Returns the bindings path, or None if DCGM is unusable.
+    """
+    deadline = time.monotonic() + max(0, wait_seconds)
+    while True:
+        if nv_hostengine_running():
+            for ppath in paths + [
+                "/usr/share/datacenter-gpu-manager-*/bindings/python3/",
+                "/usr/local/dcgm/bindings/python3/",
+            ]:
+                search_ppath = glob.glob(ppath)
+                if search_ppath:
+                    return search_ppath[-1]
+            # Engine is up but the bindings are missing — waiting won't fix that.
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(2)
 
 
 if __name__ == '__main__':
@@ -934,11 +981,19 @@ within a cgroup')
         type=int,
         default=10,
         help='DCGM update interval in seconds, default is 10')
+    PARSER.add_argument(
+        '--dcgm-wait',
+        type=int,
+        default=60,
+        help='Seconds to wait at startup for nv-hostengine before falling back to '
+             'nvml, default is 60. Stops a slow or still-restarting DCGM host engine '
+             'from permanently downgrading the exporter to the nvml fallback.')
     ARGS = PARSER.parse_args()
 
     monitor = ARGS.monitor
+    dcgm_requested = (monitor == 'dcgm')
     if monitor == 'dcgm':
-        dcgm_binding_path = search_dcgm_lib()
+        dcgm_binding_path = search_dcgm_lib(wait_seconds=ARGS.dcgm_wait)
         cannot_import_dcgm = True
         if dcgm_binding_path is not None:
             sys.path.insert(0, dcgm_binding_path)
@@ -952,7 +1007,9 @@ within a cgroup')
                 cannot_import_dcgm = False
         if cannot_import_dcgm:
             monitor = "nvml"
-            print("WARNING: --monitor=dcgm, but nv-hostengine was not running. Falling back to --monitor=nvml")
+            print("WARNING: --monitor=dcgm, but nv-hostengine did not appear within "
+                  "{}s. Falling back to --monitor=nvml; will re-check periodically "
+                  "and restart into DCGM mode once it is available.".format(ARGS.dcgm_wait))
 
     if monitor == "nvml":
         try:
@@ -964,7 +1021,8 @@ within a cgroup')
                 monitor = None
                 print("WARNING: --monitor=nvml, but neither pynvml or py3nvml could be imported. Disabling GPU monitoring.")
 
-    APP = make_wsgi_app(SlurmJobCollector(dcgm_update_interval=ARGS.dcgm_update_interval, monitor=monitor))
+    APP = make_wsgi_app(SlurmJobCollector(dcgm_update_interval=ARGS.dcgm_update_interval,
+                                          monitor=monitor, dcgm_requested=dcgm_requested))
     HTTPD = make_server('', ARGS.port, APP,
                         handler_class=NoLoggingWSGIRequestHandler)
     HTTPD.serve_forever()
