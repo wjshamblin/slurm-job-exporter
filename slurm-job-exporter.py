@@ -17,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.3"
+__version__ = "0.4.12+cus.4"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -993,7 +993,13 @@ within a cgroup')
     monitor = ARGS.monitor
     dcgm_requested = (monitor == 'dcgm')
     if monitor == 'dcgm':
-        dcgm_binding_path = search_dcgm_lib(wait_seconds=ARGS.dcgm_wait)
+        # On a node with no NVIDIA driver loaded (CPU-only compute node) the
+        # host engine can never appear, so don't sit through --dcgm-wait before
+        # serving metrics. Only the startup wait is skipped: the periodic
+        # DCGM re-check in collect() stays armed, so a GPU node whose driver
+        # wasn't up yet still recovers into DCGM mode once it is.
+        wait_seconds = ARGS.dcgm_wait if os.path.exists('/proc/driver/nvidia') else 0
+        dcgm_binding_path = search_dcgm_lib(wait_seconds=wait_seconds)
         cannot_import_dcgm = True
         if dcgm_binding_path is not None:
             sys.path.insert(0, dcgm_binding_path)
@@ -1009,7 +1015,7 @@ within a cgroup')
             monitor = "nvml"
             print("WARNING: --monitor=dcgm, but nv-hostengine did not appear within "
                   "{}s. Falling back to --monitor=nvml; will re-check periodically "
-                  "and restart into DCGM mode once it is available.".format(ARGS.dcgm_wait))
+                  "and restart into DCGM mode once it is available.".format(wait_seconds))
 
     if monitor == "nvml":
         try:
