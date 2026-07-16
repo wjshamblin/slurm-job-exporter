@@ -112,6 +112,38 @@ def scontrol_job_owner(job):
     return uid, user, account
 
 
+def scontrol_job_cpus(job):
+    """
+    Return the billed CPUs (Slurm NumCPUs) for a job, per node.
+
+    The exporter otherwise only sees the cgroup cpuset, and count(core_usage)
+    counts the CPUs in it. On SMT nodes that hand out whole cores (task/affinity),
+    a job's cpuset holds BOTH hardware threads of every allocated core -- up to 2x
+    the CPUs the job requested and is billed for (NumCPUs). Anything built on the
+    thread count therefore mis-measures: an efficiency dashboard reads a ~50% floor
+    for a serial job, and a --hint=nomultithread job (whose cpuset is 2x its billed
+    CPUs) reads ~50% while running optimally. NumCPUs is the requested/billed figure
+    and only Slurm knows it, so read it from scontrol.
+
+    Returns per-node CPUs (NumCPUs / NumNodes, exact for homogeneous jobs) or None
+    if the job can't be resolved. Billed CPUs never change over a job's life, so
+    callers cache the result rather than paying scontrol every scrape.
+    """
+    try:
+        out = subprocess.check_output(
+            ['scontrol', 'show', 'job', str(job)],
+            stderr=subprocess.DEVNULL).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    m = re.search(r'NumCPUs=(\d+)', out)
+    if not m:
+        return None
+    num_cpus = int(m.group(1))
+    n = re.search(r'NumNodes=(\d+)', out)
+    num_nodes = int(n.group(1)) if n and int(n.group(1)) > 0 else 1
+    return num_cpus // num_nodes
+
+
 # CHECK-UNUSED-GPUS PATCH: Slurm >= 25.11 (cgroup/v2) SLUID cgroup naming.
 # Slurm 25.11/26.05 renamed the job-level cgroup from job_<jobid> to the job's
 # SLUID (an "s" + Crockford-base32 string, e.g. slurmstepd.scope/s8FXKX84GSBB00/).
@@ -208,6 +240,12 @@ class SlurmJobCollector(object):
         # nvml can be recovered from rather than being permanent (see collect()).
         self.dcgm_requested = dcgm_requested
         self._dcgm_recheck_at = 0.0
+        # CHECK-UNUSED-GPUS PATCH: cache of billed CPUs (Slurm NumCPUs) per jobid.
+        # The cgroup only exposes the cpuset (hardware threads); on SMT nodes that
+        # allocate whole cores (e.g. task/affinity) that is up to 2x the CPUs the
+        # job was actually billed for. NumCPUs is only knowable from scontrol, so
+        # look it up once and cache it — it never changes over a job's lifetime.
+        self._cpus_alloc_cache = {}
         if monitor == 'dcgm':
             self.handle = pydcgm.DcgmHandle(None, 'localhost')
 
@@ -464,6 +502,14 @@ class SlurmJobCollector(object):
             'slurm_job_core_usage', 'Cpu usage of cores allocated to a job',
             labels=['user', 'account', 'slurmjobid', 'core'])
 
+        # CHECK-UNUSED-GPUS PATCH: billed CPUs (Slurm NumCPUs) per node. Normalise
+        # utilisation against THIS, not count(slurm_job_core_usage) — the latter
+        # counts cpuset threads, which is 2x the billed CPUs on whole-core SMT nodes.
+        metrics['gauge_cpus_alloc'] = GaugeMetricFamily(
+            'slurm_job_cpus_alloc',
+            'Billed CPUs (Slurm NumCPUs) allocated to a job on this node',
+            labels=['user', 'account', 'slurmjobid'])
+
         metrics['gauge_process_count'] = GaugeMetricFamily(
             'slurm_job_process_count', 'Number of processes in a job',
             labels=['user', 'account', 'slurmjobid'])
@@ -679,6 +725,19 @@ per elapsed cycle)',
                     for core in cores:
                         metrics["counter_core_usage"].add_metric([user, account, job, str(core)], fake_usage_per_core)
 
+            # CHECK-UNUSED-GPUS PATCH: emit billed CPUs (NumCPUs) alongside the
+            # per-thread core_usage series. count(core_usage) above counts cpuset
+            # threads (2x billed on whole-core SMT nodes); consumers should divide
+            # utilisation by this gauge instead. Cached per jobid — billed CPUs are
+            # fixed for a job's life, so this costs one scontrol call per new job.
+            cpus_alloc = self._cpus_alloc_cache.get(job)
+            if cpus_alloc is None:
+                cpus_alloc = scontrol_job_cpus(job)
+                if cpus_alloc is not None:
+                    self._cpus_alloc_cache[job] = cpus_alloc
+            if cpus_alloc is not None:
+                metrics["gauge_cpus_alloc"].add_metric([user, account, job], cpus_alloc)
+
             processes = 0
             tasks_state = {}
             for proc in procs:
@@ -873,6 +932,7 @@ per elapsed cycle)',
                             dcgm_data[gpu_uuid]['nvlink_rx_bytes'])
 
         scrape_job_errors = 0
+        seen_jobs = set()
         for job_dir in glob.glob(jobs_glob):
             # slurmstepd.scope/* also globs cgroup control files (cgroup.procs,
             # memory.stat, ...) — only directories are job/step cgroups.
@@ -893,6 +953,7 @@ per elapsed cycle)',
                 job = jobid_from_stepd(job_dir)
                 if job is None:
                     continue
+            seen_jobs.add(job)
             try:
                 _process_job(job_dir, job)
             except (FileNotFoundError, ProcessLookupError, psutil.NoSuchProcess):
@@ -908,6 +969,11 @@ per elapsed cycle)',
                 print('scrape error on {}: {}: {}'.format(
                     job_dir, type(e).__name__, e), file=sys.stderr)
                 continue
+
+        # CHECK-UNUSED-GPUS PATCH: drop cached billed-CPU entries for jobs that are
+        # no longer on this node, so the cache tracks live jobs instead of growing.
+        self._cpus_alloc_cache = {
+            j: v for j, v in self._cpus_alloc_cache.items() if j in seen_jobs}
 
         metrics['scrape_errors'].add_metric([], scrape_job_errors)
         yield from metrics.values()
