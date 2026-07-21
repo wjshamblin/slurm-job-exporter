@@ -17,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.4"
+__version__ = "0.4.12+cus.5"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -262,6 +262,12 @@ class SlurmJobCollector(object):
             self.fieldIds_dict = {
                 dcgm_fields.DCGM_FI_DEV_NAME: 'name',
                 dcgm_fields.DCGM_FI_DEV_UUID: 'uuid',
+                # CHECK-UNUSED-GPUS PATCH: physical index for the 'gpu' label.
+                # The cgroup probe only sees job-local ordinals (a 1-GPU job is
+                # always "GPU 0" inside its cgroup); this field carries the
+                # host-level NVML index so the label matches nvidia-smi and
+                # dcgm-exporter.
+                dcgm_fields.DCGM_FI_DEV_NVML_INDEX: 'nvml_index',
                 dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR: 'cuda_visible_devices_str',
                 dcgm_fields.DCGM_FI_DEV_POWER_USAGE: 'power_usage',
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL: 'fb_total',
@@ -289,6 +295,7 @@ class SlurmJobCollector(object):
             avail_metrics = {
                 dcgm_fields.DCGM_FI_DEV_NAME,
                 dcgm_fields.DCGM_FI_DEV_UUID,
+                dcgm_fields.DCGM_FI_DEV_NVML_INDEX,
                 dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR,
                 dcgm_fields.DCGM_FI_DEV_POWER_USAGE,
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL,
@@ -810,6 +817,13 @@ per elapsed cycle)',
                     gpu = gpu_tuple[0]
                     gpu_uuid = gpu_tuple[1]
                     handle = self.pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid.encode())
+                    # CHECK-UNUSED-GPUS PATCH: label with the physical index
+                    # (matches nvidia-smi / dcgm-exporter), not the cgroup
+                    # ordinal; keep the ordinal if NVML can't report it.
+                    try:
+                        gpu = self.pynvml.nvmlDeviceGetIndex(handle)
+                    except self.pynvml.NVMLError:
+                        pass
                     name = self.pynvml.nvmlDeviceGetName(handle)
                     if type(name) is str:
                         gpu_type = self.pynvml.nvmlDeviceGetName(handle)
@@ -847,6 +861,15 @@ per elapsed cycle)',
                     # skip it rather than KeyError-ing the whole scrape.
                     if gpu_uuid not in dcgm_data:
                         continue
+                    # CHECK-UNUSED-GPUS PATCH: label full GPUs with the physical
+                    # (NVML) index instead of the job-local cgroup ordinal, which
+                    # is 0..N-1 within every job and never matches nvidia-smi on
+                    # shared nodes. Fall back to the ordinal when DCGM doesn't
+                    # supply the index. MIG labels (UUIDs) are unchanged.
+                    if gpu_tuple[0] is not None:
+                        nvml_index = dcgm_data[gpu_uuid].get('nvml_index')
+                        if nvml_index is not None:
+                            gpu = int(nvml_index)
                     gpu_type = dcgm_data[gpu_uuid]['name']
                     # Converting DCGM data to the same format as NVML and reusing the same metrics.
                     # fb_total/fb_used/power_usage are normally always present, but
