@@ -17,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.5"
+__version__ = "0.4.12+cus.6"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -142,6 +142,21 @@ def scontrol_job_cpus(job):
     n = re.search(r'NumNodes=(\d+)', out)
     num_nodes = int(n.group(1)) if n and int(n.group(1)) > 0 else 1
     return num_cpus // num_nodes
+
+
+def squeue_active_jobs():
+    """
+    Returns active jobids from squeue
+    """
+    try:
+        out = subprocess.check_output(
+            ['squeue', '--noheader', '--format=%A',
+            '--states=RUNNING,SUSPENDED,COMPLETING',
+            '--nodelist', os.uname().nodename.split('.')[0]],
+            stderr=subprocess.DEVNULL).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return set(out.split())
 
 
 # CHECK-UNUSED-GPUS PATCH: Slurm >= 25.11 (cgroup/v2) SLUID cgroup naming.
@@ -954,6 +969,7 @@ per elapsed cycle)',
                             [user, account, job, str(gpu), gpu_type, 'RX'],
                             dcgm_data[gpu_uuid]['nvlink_rx_bytes'])
 
+        active_jobs = squeue_active_jobs()
         scrape_job_errors = 0
         seen_jobs = set()
         for job_dir in glob.glob(jobs_glob):
@@ -976,6 +992,8 @@ per elapsed cycle)',
                 job = jobid_from_stepd(job_dir)
                 if job is None:
                     continue
+            if active_jobs is not None and job not in active_jobs:
+                continue
             seen_jobs.add(job)
             try:
                 _process_job(job_dir, job)
