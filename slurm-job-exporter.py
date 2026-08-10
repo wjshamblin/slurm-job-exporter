@@ -17,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.5"
+__version__ = "0.4.12+cus.6"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -260,25 +260,25 @@ class SlurmJobCollector(object):
 
             # https://github.com/NVIDIA/gpu-monitoring-tools/blob/master/bindings/go/dcgm/dcgm_fields.h
             self.fieldIds_dict = {
-                dcgm_fields.DCGM_FI_DEV_NAME: 'name',
-                dcgm_fields.DCGM_FI_DEV_UUID: 'uuid',
+                dcgm_fields.DCGM_FI_DEV_GPU_NAME: 'name',
+                dcgm_fields.DCGM_FI_DEV_GPU_UUID: 'uuid',
                 # CHECK-UNUSED-GPUS PATCH: physical index for the 'gpu' label.
                 # The cgroup probe only sees job-local ordinals (a 1-GPU job is
                 # always "GPU 0" inside its cgroup); this field carries the
                 # host-level NVML index so the label matches nvidia-smi and
                 # dcgm-exporter.
                 dcgm_fields.DCGM_FI_DEV_NVML_INDEX: 'nvml_index',
-                dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR: 'cuda_visible_devices_str',
-                dcgm_fields.DCGM_FI_DEV_POWER_USAGE: 'power_usage',
+                dcgm_fields.DCGM_FI_CUDA_GPU_VISIBLE_DEVICES: 'cuda_visible_devices_str',
+                dcgm_fields.DCGM_FI_DEV_BOARD_POWER_WATTS: 'power_usage',
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL: 'fb_total',
                 dcgm_fields.DCGM_FI_DEV_FB_USED: 'fb_used',
-                dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE: 'fp64_active',
-                dcgm_fields.DCGM_FI_PROF_PIPE_FP32_ACTIVE: 'fp32_active',
-                dcgm_fields.DCGM_FI_PROF_PIPE_FP16_ACTIVE: 'fp16_active',
-                dcgm_fields.DCGM_FI_PROF_SM_ACTIVE: 'sm_active',
-                dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY: 'sm_occupancy',
-                dcgm_fields.DCGM_FI_PROF_PIPE_TENSOR_ACTIVE: 'tensor_active',
-                dcgm_fields.DCGM_FI_PROF_DRAM_ACTIVE: 'dram_active',
+                dcgm_fields.DCGM_FI_PROF_FP64_UTIL_RATIO: 'fp64_active',
+                dcgm_fields.DCGM_FI_PROF_FP32_UTIL_RATIO: 'fp32_active',
+                dcgm_fields.DCGM_FI_PROF_FP16_UTIL_RATIO: 'fp16_active',
+                dcgm_fields.DCGM_FI_PROF_SM_UTIL_RATIO: 'sm_active',
+                dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY_RATIO: 'sm_occupancy',
+                dcgm_fields.DCGM_FI_PROF_TENSOR_UTIL_RATIO: 'tensor_active',
+                dcgm_fields.DCGM_FI_PROF_DRAM_UTIL_RATIO: 'dram_active',
                 dcgm_fields.DCGM_FI_PROF_PCIE_TX_BYTES: 'pcie_tx_bytes',
                 dcgm_fields.DCGM_FI_PROF_PCIE_RX_BYTES: 'pcie_rx_bytes',
                 dcgm_fields.DCGM_FI_PROF_NVLINK_TX_BYTES: 'nvlink_tx_bytes',
@@ -293,11 +293,11 @@ class SlurmJobCollector(object):
 
             # We start with those and assume they are always available
             avail_metrics = {
-                dcgm_fields.DCGM_FI_DEV_NAME,
-                dcgm_fields.DCGM_FI_DEV_UUID,
+                dcgm_fields.DCGM_FI_DEV_GPU_NAME,
+                dcgm_fields.DCGM_FI_DEV_GPU_UUID,
                 dcgm_fields.DCGM_FI_DEV_NVML_INDEX,
-                dcgm_fields.DCGM_FI_DEV_CUDA_VISIBLE_DEVICES_STR,
-                dcgm_fields.DCGM_FI_DEV_POWER_USAGE,
+                dcgm_fields.DCGM_FI_CUDA_GPU_VISIBLE_DEVICES,
+                dcgm_fields.DCGM_FI_DEV_BOARD_POWER_WATTS,
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL,
                 dcgm_fields.DCGM_FI_DEV_FB_USED,
             }
@@ -552,30 +552,30 @@ global (device) memory was being read or written.',
 
         if self.MONITOR_DCGM:
             # DCGM have additional metrics for GPU
-            if dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY in self.used_metrics:
+            if dcgm_fields.DCGM_FI_PROF_SM_OCCUPANCY_RATIO in self.used_metrics:
                 metrics['gauge_sm_occupancy_gpu'] = GaugeMetricFamily(
                     'slurm_job_sm_occupancy_gpu',
                     'The ratio of number of warps resident on an SM. \
 (number of resident as a ratio of the theoretical maximum number of warps \
 per elapsed cycle)',
                     labels=['user', 'account', 'slurmjobid', 'gpu', 'gpu_type'])
-            if dcgm_fields.DCGM_FI_PROF_PIPE_TENSOR_ACTIVE in self.used_metrics:
+            if dcgm_fields.DCGM_FI_PROF_TENSOR_UTIL_RATIO in self.used_metrics:
                 metrics['gauge_tensor_gpu'] = GaugeMetricFamily(
                     'slurm_job_tensor_gpu',
                     'The ratio of cycles the tensor (HMMA) pipe is active \
 (off the peak sustained elapsed cycles)',
                     labels=['user', 'account', 'slurmjobid', 'gpu', 'gpu_type'])
-            if dcgm_fields.DCGM_FI_PROF_PIPE_FP64_ACTIVE in self.used_metrics:
+            if dcgm_fields.DCGM_FI_PROF_FP64_UTIL_RATIO in self.used_metrics:
                 metrics['gauge_fp64_gpu'] = GaugeMetricFamily(
                     'slurm_job_fp64_gpu',
                     'Ratio of cycles the fp64 pipe is active',
                     labels=['user', 'account', 'slurmjobid', 'gpu', 'gpu_type'])
-            if dcgm_fields.DCGM_FI_PROF_PIPE_FP32_ACTIVE in self.used_metrics:
+            if dcgm_fields.DCGM_FI_PROF_FP32_UTIL_RATIO in self.used_metrics:
                 metrics["gauge_fp32_gpu"] = GaugeMetricFamily(
                     'slurm_job_fp32_gpu',
                     'Ratio of cycles the fp32 pipe is active',
                     labels=['user', 'account', 'slurmjobid', 'gpu', 'gpu_type'])
-            if dcgm_fields.DCGM_FI_PROF_PIPE_FP16_ACTIVE in self.used_metrics:
+            if dcgm_fields.DCGM_FI_PROF_FP16_UTIL_RATIO in self.used_metrics:
                 metrics["gauge_fp16_gpu"] = GaugeMetricFamily(
                     'slurm_job_fp16_gpu',
                     'Ratio of cycles the fp16 pipe is active',
