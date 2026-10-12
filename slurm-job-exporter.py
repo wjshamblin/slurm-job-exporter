@@ -17,7 +17,7 @@ from prometheus_client import make_wsgi_app
 # tag on wjshamblin/slurm-job-exporter. Exported as slurm_job_exporter_build_info
 # so Prometheus can see, and alert on, version drift across the fleet (the exact
 # blind spot that let a hand-hotfixed build diverge from git unnoticed).
-__version__ = "0.4.12+cus.6"
+__version__ = "0.4.12+cus.7"
 
 
 GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
@@ -27,6 +27,55 @@ GPU_UUID_RE = re.compile('(GPU|MIG)-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 # profiling ratio, memory size, or power reading is never anywhere near this, so
 # any numeric field at or above it is a blank, not data. See GetLatestGpuValuesAsDict.
 DCGM_FP64_BLANK = 140737488355328.0  # == 2^47
+
+# cus.7: DCGM profiling-stall guard.
+# DCGM's profiling session for a GPU can go quiet (seen fleet-wide on DCGM
+# 4.7.0: SM_ACTIVE reads a fresh 0.0 for hours while nvidia-smi and
+# DCGM_FI_DEV_GPU_UTIL show the card at 80-100%). It is not a blank, so the
+# sentinel drop and the NVML fallback never fire, and the exporter publishes
+# 0% for a busy GPU until some client re-establishes a profiling watch
+# (`dcgmi dmon -e 1001` was enough). Guard: watch the always-available
+# device-level utilization alongside the profiling fields, treat "SM_ACTIVE at
+# zero while the device is busy" as a stalled session, substitute the device
+# reading for that scrape, and re-arm our own watch. The stall test is an
+# EXACT zero: SM_ACTIVE is averaged over all SMs, so a rank parked in a NCCL
+# wait kernel (one SM busy out of 142 on a 6000 Ada) legitimately reads 0.007
+# at 100% device util, and a single resident warp on a 188-SM card at 10%
+# engine activity is ~0.0005. Any non-zero value is data; a busy device with
+# no SM cycles at all is not physically possible and only a dead profiling
+# session produces it.
+PROF_STALL_GPU_UTIL_MIN = 10       # DEV_GPU_UTIL percent at/above this is "busy"
+DCGM_REARM_MIN_INTERVAL = 60.0     # seconds between detection-triggered re-arms
+DCGM_REARM_PERIOD = 900.0          # unconditional re-arm cadence (seconds)
+
+
+def profiling_stalled(sm_active, gpu_util):
+    """True when DCGM profiling has gone quiet on a GPU that is demonstrably busy."""
+    if sm_active is None or gpu_util is None:
+        return False
+    return sm_active <= 0.0 and gpu_util >= PROF_STALL_GPU_UTIL_MIN
+
+
+def gpu_utilization_values(data):
+    """Pick the utilization pair to export for one GPU's DCGM values.
+
+    Returns (utilization_pct, memory_utilization_pct, stalled). Healthy
+    profiling yields SM_ACTIVE / DRAM_ACTIVE in percent; a stalled session
+    yields the device-level DEV_GPU_UTIL / DEV_MEM_COPY_UTIL instead; no
+    profiling data at all yields (None, None, False) so the caller can try the
+    NVML fallback.
+    """
+    sm_active = data.get('sm_active')
+    dram_active = data.get('dram_active')
+    gpu_util = data.get('gpu_util')
+    mem_copy_util = data.get('mem_copy_util')
+    if profiling_stalled(sm_active, gpu_util):
+        return (gpu_util, mem_copy_util, True)
+    if sm_active is None:
+        return (None, None, False)
+    return (sm_active * 100,
+            dram_active * 100 if dram_active is not None else None,
+            False)
 
 
 @lru_cache(maxsize=100)
@@ -246,6 +295,11 @@ class SlurmJobCollector(object):
         # job was actually billed for. NumCPUs is only knowable from scontrol, so
         # look it up once and cache it — it never changes over a job's lifetime.
         self._cpus_alloc_cache = {}
+        # cus.7: DCGM watch re-arm bookkeeping (see profiling_stalled()).
+        self._dcgm_update_interval = dcgm_update_interval
+        self._last_rearm = time.monotonic()
+        self._rearm_count = 0
+        self._prof_stalled_gpus = 0
         if monitor == 'dcgm':
             self.handle = pydcgm.DcgmHandle(None, 'localhost')
 
@@ -272,6 +326,10 @@ class SlurmJobCollector(object):
                 dcgm_fields.DCGM_FI_DEV_BOARD_POWER_WATTS: 'power_usage',
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL: 'fb_total',
                 dcgm_fields.DCGM_FI_DEV_FB_USED: 'fb_used',
+                # cus.7: device-level utilization, always available, used to
+                # detect a stalled profiling session (see profiling_stalled()).
+                dcgm_fields.DCGM_FI_DEV_GPU_UTIL: 'gpu_util',
+                dcgm_fields.DCGM_FI_DEV_MEM_COPY_UTIL: 'mem_copy_util',
                 dcgm_fields.DCGM_FI_PROF_FP64_UTIL_RATIO: 'fp64_active',
                 dcgm_fields.DCGM_FI_PROF_FP32_UTIL_RATIO: 'fp32_active',
                 dcgm_fields.DCGM_FI_PROF_FP16_UTIL_RATIO: 'fp16_active',
@@ -300,6 +358,8 @@ class SlurmJobCollector(object):
                 dcgm_fields.DCGM_FI_DEV_BOARD_POWER_WATTS,
                 dcgm_fields.DCGM_FI_DEV_FB_TOTAL,
                 dcgm_fields.DCGM_FI_DEV_FB_USED,
+                dcgm_fields.DCGM_FI_DEV_GPU_UTIL,
+                dcgm_fields.DCGM_FI_DEV_MEM_COPY_UTIL,
             }
             # CHECK-UNUSED-GPUS PATCH: profiling-tolerant
             # Older GPUs (Maxwell/Pascal/early Volta) lack DCGM profiling.
@@ -379,6 +439,33 @@ class SlurmJobCollector(object):
                 self.MONITOR_PYNVML = True
                 print('Monitoring GPUs with pynvml')
                 self.pynvml = pynvml
+
+    def _rearm_dcgm_watches(self, now, reason):
+        """Re-issue the DCGM field watches with the startup parameters.
+
+        cus.7: a quiet profiling session resumes as soon as any client
+        establishes a profiling watch, so re-watching our own field groups is
+        the repair. Rate-limited so a persistent stall cannot turn every
+        scrape into a watch call. Returns True when a re-arm was issued.
+        """
+        if now - self._last_rearm < DCGM_REARM_MIN_INTERVAL:
+            return False
+        self._last_rearm = now
+        try:
+            for group in self.groups:
+                self.groups[group].samples.WatchFields(
+                    self.field_groups[group],
+                    self._dcgm_update_interval * 1000 * 1000,
+                    self._dcgm_update_interval * 2.0, 5)
+            handle = getattr(self, 'handle', None)
+            if handle is not None:
+                handle.GetSystem().UpdateAllFields(True)
+        except Exception as e:  # never let a repair attempt 500 the scrape
+            print('DCGM watch re-arm failed (%s): %s' % (reason, e), file=sys.stderr)
+            return False
+        self._rearm_count += 1
+        print('DCGM field watches re-armed (%s)' % reason, file=sys.stderr)
+        return True
 
     def GetLatestGpuValuesAsDict(self):
         gpus = {}
@@ -607,6 +694,33 @@ per elapsed cycle)',
         # DCGM values are node-global and identical for every job, so fetch them
         # once per scrape rather than re-fetching inside the per-job loop.
         dcgm_data = self.GetLatestGpuValuesAsDict() if self.MONITOR_DCGM else {}
+
+        # cus.7: profiling-stall guard. Node-global, so judge every GPU once per
+        # scrape (not per job): count the stalled sessions, repair by re-arming
+        # our watches, and re-arm on a slow cadence regardless as insurance.
+        self._prof_stalled_gpus = 0
+        if self.MONITOR_DCGM:
+            now = time.monotonic()
+            for gpu_values in dcgm_data.values():
+                if gpu_utilization_values(gpu_values)[2]:
+                    self._prof_stalled_gpus += 1
+            if self._prof_stalled_gpus:
+                self._rearm_dcgm_watches(
+                    now, 'profiling stalled on %d GPU(s)' % self._prof_stalled_gpus)
+            elif now - self._last_rearm >= DCGM_REARM_PERIOD:
+                self._rearm_dcgm_watches(now, 'periodic')
+        metrics['prof_stalled_gpus'] = GaugeMetricFamily(
+            'slurm_job_exporter_dcgm_profiling_stalled_gpus',
+            'GPUs whose DCGM profiling session read zero while the device was '
+            'busy during this scrape; their utilization was taken from '
+            'DCGM_FI_DEV_GPU_UTIL instead of SM_ACTIVE.',
+            labels=[])
+        metrics['prof_stalled_gpus'].add_metric([], self._prof_stalled_gpus)
+        metrics['watch_rearms'] = CounterMetricFamily(
+            'slurm_job_exporter_dcgm_watch_rearms',
+            'Times the exporter re-issued its DCGM field watches since start.',
+            labels=[])
+        metrics['watch_rearms'].add_metric([], self._rearm_count)
 
         # Each job is handled by this closure, called under try/except below.
         # Slurm tears cgroups down asynchronously, so any cgroup file can vanish
@@ -888,16 +1002,16 @@ per elapsed cycle)',
                         metrics["gauge_power_gpu"].add_metric(
                             [user, account, job, str(gpu), gpu_type],
                             dcgm_data[gpu_uuid]['power_usage'] * 1000)  # convert to mW
+                    # cus.7: SM_ACTIVE / DRAM_ACTIVE in percent, or the device-level
+                    # utilization when the profiling session has stalled on this card.
+                    util_pct, mem_util_pct, _stalled = gpu_utilization_values(dcgm_data[gpu_uuid])
                     sm_active = dcgm_data[gpu_uuid].get('sm_active')
-                    dram_active = dcgm_data[gpu_uuid].get('dram_active')
-                    if sm_active is not None:
+                    if util_pct is not None:
                         metrics["gauge_utilization_gpu"].add_metric(
-                            [user, account, job, str(gpu), gpu_type],
-                            sm_active * 100)  # convert to %
-                    if dram_active is not None:
+                            [user, account, job, str(gpu), gpu_type], util_pct)
+                    if mem_util_pct is not None:
                         metrics["gauge_memory_utilization_gpu"].add_metric(
-                            [user, account, job, str(gpu), gpu_type],
-                            dram_active * 100)  # convert to %
+                            [user, account, job, str(gpu), gpu_type], mem_util_pct)
                     # CHECK-UNUSED-GPUS PATCH: NVML utilization fallback.
                     # When DCGM has no profiling data for this GPU (sm_active absent),
                     # fall back to NVML's device-level utilization so non-profiling
